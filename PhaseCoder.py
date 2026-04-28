@@ -104,47 +104,70 @@ class MicrophonePositionalEmbedding(nn.Module):
     def forward(self, mic_coords: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            mic_coords: (B, C, 3) — Cartesian (x, y, z) for each mic
- 
+            mic_coords: (B, C, 3)    — Cartesian (x, y, z) for each mic, or
+                        (B, F, C, 3) — per-frame coords for IMU-driven mode.
+
         Returns:
-            embedding: (B, C, D)
+            embedding: (B, C, D) or (B, F, C, D) matching the input rank.
         """
-        # Compute centroid per batch
-        centroid = mic_coords.mean(dim=1, keepdim=True)  # (B, 1, 3)
-        rel = mic_coords - centroid  # (B, C, 3)
- 
-        x_rel = rel[..., 0]  # (B, C)
+        # Centroid over the mic axis (second-to-last spatial dim) — works for both 3D and 4D.
+        centroid = mic_coords.mean(dim=-2, keepdim=True)  # (..., 1, 3)
+        rel = mic_coords - centroid                        # (..., C, 3)
+
+        x_rel = rel[..., 0]  # (..., C)
         y_rel = rel[..., 1]
         z_rel = rel[..., 2]
- 
+
         # Spherical coordinates
-        r = torch.sqrt(x_rel**2 + y_rel**2 + z_rel**2).clamp(min=1e-8)  # (B, C)
+        r = torch.sqrt(x_rel**2 + y_rel**2 + z_rel**2).clamp(min=1e-8)  # (..., C)
         theta = torch.acos((z_rel / r).clamp(-1.0, 1.0))                 # elevation angle
         phi = torch.atan2(y_rel, x_rel)                                   # azimuth angle
- 
-        # Build embedding: (B, C, D)
-        # v is (D/4,), broadcast with theta/phi which are (B, C)
-        v = self.v  # (D/4,)
- 
-        # (B, C, 1) * (1, 1, D/4) → (B, C, D/4)
-        angle_base = 2.0 * math.pi * self.beta * v.unsqueeze(0).unsqueeze(0)
- 
-        theta_exp = theta.unsqueeze(-1)  # (B, C, 1)
-        phi_exp = phi.unsqueeze(-1)      # (B, C, 1)
-        r_exp = r.unsqueeze(-1)          # (B, C, 1)
- 
-        cos_theta = torch.cos(angle_base + theta_exp)  # (B, C, D/4)
+
+        # v shape (D/4,) — build angle_base that broadcasts over all leading dims.
+        # angle_base: (D/4,) broadcast with (..., C, 1) → (..., C, D/4)
+        angle_base = 2.0 * math.pi * self.beta * self.v  # (D/4,)
+
+        theta_exp = theta.unsqueeze(-1)  # (..., C, 1)
+        phi_exp = phi.unsqueeze(-1)      # (..., C, 1)
+        r_exp = r.unsqueeze(-1)          # (..., C, 1)
+
+        cos_theta = torch.cos(angle_base + theta_exp)  # (..., C, D/4)
         sin_theta = torch.sin(angle_base + theta_exp)
         cos_phi = torch.cos(angle_base + phi_exp)
         sin_phi = torch.sin(angle_base + phi_exp)
- 
+
         # Concatenate to form D-dim vector, scale by alpha * r
-        emb = torch.cat([cos_theta, sin_theta, cos_phi, sin_phi], dim=-1)  # (B, C, D)
+        emb = torch.cat([cos_theta, sin_theta, cos_phi, sin_phi], dim=-1)  # (..., C, D)
         emb = self.alpha * r_exp * emb
- 
+
         return emb
  
  
+def quaternion_to_rotation_matrix(q: torch.Tensor) -> torch.Tensor:
+    """Convert unit quaternions to rotation matrices.
+
+    Accepts any leading batch dimensions; the last dim must be 4 in (w, x, y, z) order.
+
+    Args:
+        q: (..., 4) — quaternions, need not be pre-normalized.
+
+    Returns:
+        R: (..., 3, 3) — corresponding SO(3) rotation matrices.
+    """
+    q = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+
+    R = torch.stack(
+        [
+            1 - 2 * (y * y + z * z), 2 * (x * y - z * w), 2 * (x * z + y * w),
+            2 * (x * y + z * w), 1 - 2 * (x * x + z * z), 2 * (y * z - x * w),
+            2 * (x * z - y * w), 2 * (y * z + x * w), 1 - 2 * (x * x + y * y),
+        ],
+        dim=-1,
+    )  # (..., 9)
+    return R.reshape(q.shape[:-1] + (3, 3))
+
+
 def sinusoidal_embedding(length: int, dim: int, device: torch.device) -> torch.Tensor:
     """Standard sinusoidal positional embedding (non-learned).
  
@@ -162,21 +185,24 @@ def sinusoidal_embedding(length: int, dim: int, device: torch.device) -> torch.T
 class PhaseCoder(nn.Module):
     """
     PhaseCoder: Transformer-only spatial audio encoder.
- 
+
     Args:
-        embed_dim:      Embedding dimension D (default 256)
-        num_heads:      Attention heads (default 4)
-        num_layers:     Transformer blocks (default 5)
-        ffn_expansion:  FFN inner dim multiplier (default 1, so inner=256)
-        n_fft:          STFT window size (default 256)
-        hop_length:     STFT hop (default 128)
-        num_azimuth:    Azimuth classes (default 38, + 1 no-speech = 39)
-        num_elevation:  Elevation classes (default 18, + 1 = 19)
-        num_distance:   Distance classes (default 13, + 1 = 14)
-        alpha:          Mic embedding scale (default 7.0)
-        beta:           Mic embedding freq scale (default 4.0)
+        embed_dim:           Embedding dimension D (default 256)
+        num_heads:           Attention heads (default 4)
+        num_layers:          Transformer blocks (default 5)
+        ffn_expansion:       FFN inner dim multiplier (default 1, so inner=256)
+        n_fft:               STFT window size (default 256)
+        hop_length:          STFT hop (default 128)
+        num_azimuth:         Azimuth classes (default 38, + 1 no-speech = 39)
+        num_elevation:       Elevation classes (default 18, + 1 = 19)
+        num_distance:        Distance classes (default 13, + 1 = 14)
+        alpha:               Mic embedding scale (default 7.0)
+        beta:                Mic embedding freq scale (default 4.0)
+        canonical_frame_idx: STFT frame index used as the reference pose when IMU
+                             orientations are supplied (Option A). None → F // 2 at
+                             forward time (frame 16 for the default 33-frame clip).
     """
- 
+
     def __init__(
         self,
         embed_dim: int = 256,
@@ -190,9 +216,11 @@ class PhaseCoder(nn.Module):
         num_distance: int = 14,
         alpha: float = 7.0,
         beta: float = 4.0,
+        canonical_frame_idx: int | None = None,
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.canonical_frame_idx = canonical_frame_idx
  
         # --- Input feature extraction ---
         self.stft_extractor = STFTPatchExtractor(n_fft=n_fft, hop_length=hop_length, win_length=n_fft)
@@ -245,34 +273,73 @@ class PhaseCoder(nn.Module):
         self,
         audio: torch.Tensor,
         mic_coords: torch.Tensor,
+        imu_orientations: torch.Tensor | None = None,
     ) -> dict:
         """
         Args:
-            audio:      (B, C, T_samples) — raw multichannel audio at 16kHz
-                        For 250ms input: T_samples = 4000
-            mic_coords: (B, C, 3) — Cartesian (x,y,z) coordinates per mic in meters
- 
+            audio:            (B, C, T_samples) — raw multichannel audio at 16kHz.
+                              For 250ms input: T_samples = 4000.
+            mic_coords:       (B, C, 3) — Cartesian (x,y,z) mic positions in the
+                              device-neutral (manufacturer) frame, in metres.
+            imu_orientations: (B, F, 4) — unit quaternions (w, x, y, z) per STFT
+                              frame, SLERP-aligned to the F time steps by the data
+                              pipeline. Pass None (default) to reproduce the original
+                              static-geometry behaviour.
+
         Returns:
             dict with keys:
-                'spatial_embedding': (B, D)  — spatial soft token for LLM integration
+                'spatial_embedding': (B, D)  — spatial soft token for LLM integration.
                 'azimuth_logits':    (B, num_azimuth)
                 'elevation_logits':  (B, num_elevation)
                 'distance_logits':   (B, num_distance)
+
+            When imu_orientations is supplied, predictions are expressed in the
+            device-instantaneous frame at the canonical STFT frame index
+            (canonical_frame_idx, default F // 2).
         """
         B, C, T = audio.shape
         device = audio.device
- 
+
         # 1. STFT patch extraction → (B, C, F, 258)
         patches = self.stft_extractor(audio)
         F_frames = patches.shape[2]
- 
+
         # 2. Linear projection → (B, C, F, D)
         patches = self.patch_proj(patches)
- 
+
         # 3. Positional embeddings
-        # 3a. Mic coordinate embedding → (B, C, D), broadcast across frames
-        mic_emb = self.mic_pos_embed(mic_coords)  # (B, C, D)
-        mic_emb = mic_emb.unsqueeze(2).expand(-1, -1, F_frames, -1)  # (B, C, F, D)
+        # 3a. Mic coordinate embedding
+        if imu_orientations is None:
+            # Static path: single embedding per mic, broadcast across frames.
+            mic_emb = self.mic_pos_embed(mic_coords)  # (B, C, D)
+            mic_emb = mic_emb.unsqueeze(2).expand(-1, -1, F_frames, -1)  # (B, C, F, D)
+        else:
+            # Dynamic path: per-frame mic positions in device-instantaneous frame,
+            # expressed relative to the canonical clip pose (Option A).
+            if imu_orientations.shape != (B, F_frames, 4):
+                raise ValueError(
+                    f"imu_orientations must have shape ({B}, {F_frames}, 4); "
+                    f"got {tuple(imu_orientations.shape)}"
+                )
+            ref = self.canonical_frame_idx if self.canonical_frame_idx is not None else F_frames // 2
+            if not (0 <= ref < F_frames):
+                raise ValueError(
+                    f"canonical_frame_idx {ref} is out of range [0, {F_frames})"
+                )
+
+            # Absolute rotation matrices for every frame: (B, F, 3, 3)
+            R_abs = quaternion_to_rotation_matrix(imu_orientations)
+
+            # Express all frames relative to the canonical pose so that at f=ref
+            # the rotation is identity and the CLS prediction is in that device pose.
+            R_ref_T = R_abs[:, ref].transpose(-1, -2).unsqueeze(1)  # (B, 1, 3, 3)
+            R_rel = torch.matmul(R_ref_T, R_abs)                     # (B, F, 3, 3)
+
+            # Rotate the static neutral mic coords per frame: (B, F, C, 3)
+            mic_inst = torch.einsum("bfij,bcj->bfci", R_rel, mic_coords)
+
+            # Per-frame embedding: (B, F, C, D) → permute → (B, C, F, D)
+            mic_emb = self.mic_pos_embed(mic_inst).permute(0, 2, 1, 3)
  
         # 3b. Frame embedding (sinusoidal, same for all mics within a frame)
         frame_emb = sinusoidal_embedding(F_frames, self.embed_dim, device)  # (F, D)
@@ -400,3 +467,32 @@ if __name__ == "__main__":
     criterion = PhaseCoderLoss()
     losses = criterion(out, targets)
     print(f"Total loss: {losses['loss'].item():.4f}")
+
+    # --- IMU-driven dynamic geometry tests ---
+    # Derive the actual frame count from the STFT extractor to avoid hardcoding.
+    with torch.no_grad():
+        _probe = model.stft_extractor(audio[:1, :1])
+    F_frames = _probe.shape[2]
+
+    # (a) All-identity quaternions: every frame has zero rotation relative to neutral.
+    #     The canonical frame (idx 16) will also be identity, so R_rel = I everywhere,
+    #     and mic_inst == mic_coords for all frames.  Output shapes must match the
+    #     static-geometry forward; values will differ only because the mic_pos_embed
+    #     receives the same coords repeated F times instead of broadcast — results are
+    #     numerically identical by construction.
+    ident_quats = torch.zeros(B, F_frames, 4, device=device)
+    ident_quats[..., 0] = 1.0  # w=1 → identity quaternion
+    out_ident = model(audio, mic_coords, imu_orientations=ident_quats)
+    print(f"\n[IMU id]  Spatial embedding shape: {out_ident['spatial_embedding'].shape}")
+    print(f"[IMU id]  Azimuth logits shape:    {out_ident['azimuth_logits'].shape}")
+
+    # (b) Random unit quaternions per frame: exercises full per-frame rotation path.
+    rand_quats = torch.randn(B, F_frames, 4, device=device)
+    rand_quats = rand_quats / rand_quats.norm(dim=-1, keepdim=True)
+    out_dyn = model(audio, mic_coords, imu_orientations=rand_quats)
+    print(f"\n[IMU dyn] Spatial embedding shape: {out_dyn['spatial_embedding'].shape}")
+    print(f"[IMU dyn] Azimuth logits shape:    {out_dyn['azimuth_logits'].shape}")
+
+    # Loss computation works identically for both IMU-driven outputs.
+    losses_dyn = criterion(out_dyn, targets)
+    print(f"[IMU dyn] Total loss: {losses_dyn['loss'].item():.4f}")

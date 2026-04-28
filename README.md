@@ -31,7 +31,25 @@ Rough parameter count: ~6M (see `__main__` block for a live count).
 **Forward** (`PhaseCoder.forward`):
 
 - `audio`: `(B, C, T)` — raw multichannel waveform at **16 kHz**. Example: **250 ms** → `T = 4000`.
-- `mic_coords`: `(B, C, 3)` — Cartesian `(x, y, z)` per microphone in **meters** (relative geometry is used via centroid-centered spherical features).
+- `mic_coords`: `(B, C, 3)` — Cartesian `(x, y, z)` per microphone in **meters**, in the *device-neutral* (manufacturer) frame. These are the fixed, physical mic positions on the device; the model rotates them per frame internally when IMU data is provided.
+- `imu_orientations` *(optional)*: `(B, F, 4)` — unit quaternions in `(w, x, y, z)` order, one per STFT frame (`F = 33` for the default 250 ms / 16 kHz / hop-128 configuration). Pass `None` (default) to reproduce the original static-geometry behaviour.
+
+#### IMU preprocessing (caller's responsibility)
+
+Raw IMU data typically arrives at 100–1000 Hz. Before calling the model, **SLERP-interpolate** the quaternion stream to produce exactly `F` uniformly-spaced samples aligned to the STFT frame centres. This decouples IMU hardware from model architecture — the model never sees sample rates.
+
+#### Reference frame convention (Option A)
+
+When `imu_orientations` is provided, the model expresses all per-frame mic positions *relative* to a single canonical STFT frame (default: `F // 2 = 16`, the midpoint of the clip). Concretely:
+
+```
+R_rel_f = R_ref^T @ R_f
+p_i,f   = R_rel_f · p_i,neutral
+```
+
+At `f = ref`, `R_rel = I` and `p_i,ref = p_i,neutral`. The CLS-token output is therefore unambiguously in the **device-instantaneous frame at the canonical frame index** — a single, well-defined coordinate system per clip. To change the reference frame, pass `canonical_frame_idx=<idx>` to the `PhaseCoder` constructor.
+
+If a downstream application needs *world-relative* azimuth/elevation, compose PhaseCoder's device-frame prediction with the absolute IMU orientation at the canonical frame (available from the same SLERP output).
 
 **Returns** a `dict`:
 
