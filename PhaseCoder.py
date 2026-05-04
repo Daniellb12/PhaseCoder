@@ -468,31 +468,50 @@ if __name__ == "__main__":
     losses = criterion(out, targets)
     print(f"Total loss: {losses['loss'].item():.4f}")
 
-    # --- IMU-driven dynamic geometry tests ---
+    # --- IMU-driven dynamic geometry tests (via imu_preprocessing) ---
+    from imu_preprocessing import prepare_imu_for_phasecoder
+
     # Derive the actual frame count from the STFT extractor to avoid hardcoding.
     with torch.no_grad():
         _probe = model.stft_extractor(audio[:1, :1])
     F_frames = _probe.shape[2]
 
-    # (a) All-identity quaternions: every frame has zero rotation relative to neutral.
-    #     The canonical frame (idx 16) will also be identity, so R_rel = I everywhere,
-    #     and mic_inst == mic_coords for all frames.  Output shapes must match the
-    #     static-geometry forward; values will differ only because the mic_pos_embed
-    #     receives the same coords repeated F times instead of broadcast — results are
-    #     numerically identical by construction.
-    ident_quats = torch.zeros(B, F_frames, 4, device=device)
-    ident_quats[..., 0] = 1.0  # w=1 → identity quaternion
+    # Simulate a 500 Hz IMU stream for the 250ms clip, with ~5 samples of headroom
+    # on each side so the frame timestamps always fall within the IMU range.
+    imu_rate = 500.0
+    T_imu = int(imu_rate * dur) + 10  # 135 samples
+    raw_imu = torch.randn(B, T_imu, 4)
+    raw_imu = raw_imu / raw_imu.norm(dim=-1, keepdim=True)
+
+    # (a) All-identity quaternions — R_rel = I at every frame, equivalent to the
+    #     static path for the mic embedding at the canonical frame.
+    ident_raw = torch.zeros(B, T_imu, 4)
+    ident_raw[..., 0] = 1.0
+    ident_quats = prepare_imu_for_phasecoder(
+        imu_quats=ident_raw,
+        imu_sample_rate=imu_rate,
+        num_frames=F_frames,
+        audio_sample_rate=sr,
+        n_fft=256,
+        hop_length=128,
+    ).to(device)
     out_ident = model(audio, mic_coords, imu_orientations=ident_quats)
     print(f"\n[IMU id]  Spatial embedding shape: {out_ident['spatial_embedding'].shape}")
     print(f"[IMU id]  Azimuth logits shape:    {out_ident['azimuth_logits'].shape}")
 
-    # (b) Random unit quaternions per frame: exercises full per-frame rotation path.
-    rand_quats = torch.randn(B, F_frames, 4, device=device)
-    rand_quats = rand_quats / rand_quats.norm(dim=-1, keepdim=True)
+    # (b) SLERP-interpolated random-rotation stream — exercises the full per-frame
+    #     rotation path through prepare_imu_for_phasecoder → PhaseCoder.forward.
+    rand_quats = prepare_imu_for_phasecoder(
+        imu_quats=raw_imu,
+        imu_sample_rate=imu_rate,
+        num_frames=F_frames,
+        audio_sample_rate=sr,
+        n_fft=256,
+        hop_length=128,
+    ).to(device)
     out_dyn = model(audio, mic_coords, imu_orientations=rand_quats)
     print(f"\n[IMU dyn] Spatial embedding shape: {out_dyn['spatial_embedding'].shape}")
     print(f"[IMU dyn] Azimuth logits shape:    {out_dyn['azimuth_logits'].shape}")
 
-    # Loss computation works identically for both IMU-driven outputs.
     losses_dyn = criterion(out_dyn, targets)
     print(f"[IMU dyn] Total loss: {losses_dyn['loss'].item():.4f}")
