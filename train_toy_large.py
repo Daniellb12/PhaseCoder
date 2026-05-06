@@ -37,9 +37,8 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
-from PhaseCoder import PhaseCoder, PhaseCoderLoss
+from PhaseCoder.PhaseCoder import PhaseCoder, PhaseCoderLoss
 from train_toy import ToyDataset, collate_fn
-
 
 def get_lr_schedule(optimizer, num_epochs: int, warmup_epochs: int = 2):
     """Linear warmup followed by cosine decay."""

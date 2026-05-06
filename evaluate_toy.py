@@ -22,7 +22,7 @@ import matplotlib
 matplotlib.use("Agg")  # non-interactive backend
 import matplotlib.pyplot as plt
 
-from PhaseCoder import PhaseCoder
+from PhaseCoder.PhaseCoder import PhaseCoder
 from train_toy import ToyDataset, collate_fn
 from torch.utils.data import DataLoader
 
@@ -198,7 +198,6 @@ def main():
         }, f, indent=2)
 
     print(f"\n✓ Results saved to {output_dir}/")
-
 
 if __name__ == "__main__":
     main()

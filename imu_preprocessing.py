@@ -528,7 +528,7 @@ def _test_extrapolation_error():
 
 def _test_phasecoder_integration():
     """Full round-trip: raw IMU → frame quaternions → PhaseCoder.forward."""
-    from PhaseCoder import PhaseCoder
+    from PhaseCoder.PhaseCoder import PhaseCoder
 
     torch.manual_seed(42)
     B = 4
@@ -583,6 +583,8 @@ def _test_phasecoder_integration():
         f"elevation_logits shape: {out['elevation_logits'].shape}"
     assert out["distance_logits"].shape == (B, 14), \
         f"distance_logits shape: {out['distance_logits'].shape}"
+    assert out["mic_positions"].shape == (B, F, C, 3), \
+        f"mic_positions shape: {out['mic_positions'].shape}"
     assert not any(v.isnan().any() for v in out.values()), "NaN in model output"
 
     print(f"  ✓ PhaseCoder.forward: all output shapes correct, no NaNs")

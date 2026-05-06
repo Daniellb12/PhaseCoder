@@ -23,7 +23,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 
-from PhaseCoder import PhaseCoder, PhaseCoderLoss
+from PhaseCoder.PhaseCoder import PhaseCoder, PhaseCoderLoss
 
 
 # ---------------------------------------------------------------------------
