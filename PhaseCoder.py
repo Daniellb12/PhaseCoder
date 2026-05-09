@@ -20,7 +20,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .physics import MicPositionDecoder
+from physics import MicPositionDecoder
  
  
 class STFTPatchExtractor(nn.Module):
