@@ -39,8 +39,13 @@ from pathlib import Path
 
 import numpy as np
 import pyroomacoustics as pra
+from librispeech_source import LibriSpeechProvider
 
+# Resolve to absolute path so multiprocessing workers find it regardless of cwd
+_CACHE_DIR_ABS = str(Path("./librispeech_cache").resolve())
 
+# Lazy-initialized per worker process for multiprocessing safety
+_speech_provider = None
 # ---------------------------------------------------------------------------
 # Configuration matching PhaseCoder paper
 # ---------------------------------------------------------------------------
@@ -67,34 +72,21 @@ DISTANCE_BIN_EDGES = np.array([0.4, 0.6, 0.8, 1.0, 1.3, 1.6, 2.0, 2.5, 3.0, 3.5,
 # ---------------------------------------------------------------------------
 
 def generate_source_signal(duration_s: float, rng: np.random.Generator) -> np.ndarray:
-    """Generate a synthetic harmonic source with broadband content suitable for STFT.
-
-    Real PhaseCoder uses speech; for a toy demo, multi-harmonic signals work fine
-    and are deterministically generatable without dataset downloads.
-    """
-    n = int(SAMPLE_RATE * duration_s)
-    t = np.arange(n) / SAMPLE_RATE
-
-    f0 = rng.uniform(120, 350)  # speech-like fundamental
-    signal = np.zeros(n)
-    for harmonic in range(1, 7):
-        amp = rng.uniform(0.3, 1.0) / harmonic
-        phase = rng.uniform(0, 2 * np.pi)
-        signal += amp * np.sin(2 * np.pi * f0 * harmonic * t + phase)
-
-    # Amplitude modulation for speech-like envelope
-    am = 0.5 + 0.5 * np.sin(2 * np.pi * rng.uniform(2, 6) * t)
-    signal *= am
-
-    # Soft fades to prevent clicks
-    fade = int(0.015 * SAMPLE_RATE)
-    envelope = np.ones(n)
-    envelope[:fade] = np.linspace(0, 1, fade)
-    envelope[-fade:] = np.linspace(1, 0, fade)
-    signal *= envelope
-
-    signal /= max(np.max(np.abs(signal)), 1e-8)
-    return (signal * 0.8).astype(np.float32)
+    """Get a real-speech source signal from LibriSpeech (with synthetic fallback)."""
+    global _speech_provider
+    if _speech_provider is None:
+        _speech_provider = LibriSpeechProvider(
+            cache_dir=_CACHE_DIR_ABS,
+            subset="dev-clean",
+            max_utterances=2000,
+            synthetic_fraction=0.1,  # 10% synthetic for source diversity
+            verbose=True,
+        )
+        import os
+        print(f"  [PID {os.getpid()}] Provider initialized. "
+              f"using_synthetic_only={_speech_provider.using_synthetic_only}, "
+              f"flac_files={len(_speech_provider.flac_files)}")
+    return _speech_provider.get_signal(duration_s, rng)
 
 
 # ---------------------------------------------------------------------------
@@ -267,8 +259,8 @@ def simulate_clip(
     # Clamp source to within room
     source_world = np.clip(source_world, 0.2, room_dim - 0.2)
 
-    # Generate source signal slightly longer than clip duration
-    src_signal = generate_source_signal(CLIP_DURATION_S * 2.0, rng)
+    # Generate longer source signal (1.5s) for realistic random crop diversity
+    src_signal = generate_source_signal(CLIP_DURATION_S * 6.0, rng)
     room.add_source(source_world, signal=src_signal)
 
     # Simulate
