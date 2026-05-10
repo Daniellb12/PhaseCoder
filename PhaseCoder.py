@@ -19,6 +19,8 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from physics import MicPositionDecoder
  
  
 class STFTPatchExtractor(nn.Module):
@@ -245,6 +247,7 @@ class PhaseCoder(nn.Module):
             batch_first=True,
             norm_first=True,
         )
+        
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.norm = nn.LayerNorm(embed_dim)
  
@@ -259,7 +262,10 @@ class PhaseCoder(nn.Module):
         self.azimuth_head = nn.Linear(embed_dim, num_azimuth)
         self.elevation_head = nn.Linear(embed_dim, num_elevation)
         self.distance_head = nn.Linear(embed_dim, num_distance)
- 
+
+        # --- Mic position decoder ---
+        self.mic_pos_decoder = MicPositionDecoder(embed_dim=embed_dim, num_heads=num_heads)
+
         self._init_weights()
  
     def _init_weights(self):
@@ -288,16 +294,18 @@ class PhaseCoder(nn.Module):
 
         Returns:
             dict with keys:
-                'spatial_embedding': (B, D)  — spatial soft token for LLM integration.
+                'spatial_embedding': (B, D)       — spatial soft token for LLM integration.
                 'azimuth_logits':    (B, num_azimuth)
                 'elevation_logits':  (B, num_elevation)
                 'distance_logits':   (B, num_distance)
+                'mic_positions':     (B, F, C, 3) — predicted (x,y,z) per mic per STFT frame,
+                                     decoded from the full transformer sequence.
 
             When imu_orientations is supplied, predictions are expressed in the
             device-instantaneous frame at the canonical STFT frame index
             (canonical_frame_idx, default F // 2).
         """
-        B, C, T = audio.shape
+        B, C, _ = audio.shape
         device = audio.device
 
         # 1. STFT patch extraction → (B, C, F, 258)
@@ -368,8 +376,11 @@ class PhaseCoder(nn.Module):
         # 5. Transformer encoder
         x = self.transformer(x)
         x = self.norm(x)
- 
-        # 6. Extract [CLS] representation
+
+        # 6. Decode per-mic positions from the full transformer sequence (B, 1+C*F, D)
+        mic_positions = self.mic_pos_decoder(x, mic_coords, F_frames)  # (B, F, C, 3)
+
+        # 7. Extract [CLS] representation
         cls_out = x[:, 0]  # (B, D)
  
         # 7. Spatial embedding via 2-layer MLP
@@ -385,6 +396,7 @@ class PhaseCoder(nn.Module):
             "azimuth_logits": az_logits,
             "elevation_logits": el_logits,
             "distance_logits": dist_logits,
+            "mic_positions": mic_positions,
         }
  
  
@@ -457,6 +469,7 @@ if __name__ == "__main__":
     print(f"Azimuth logits shape:    {out['azimuth_logits'].shape}")
     print(f"Elevation logits shape:  {out['elevation_logits'].shape}")
     print(f"Distance logits shape:   {out['distance_logits'].shape}")
+    print(f"Mic positions shape:     {out['mic_positions'].shape}")
  
     # Test loss
     targets = {
@@ -498,6 +511,7 @@ if __name__ == "__main__":
     out_ident = model(audio, mic_coords, imu_orientations=ident_quats)
     print(f"\n[IMU id]  Spatial embedding shape: {out_ident['spatial_embedding'].shape}")
     print(f"[IMU id]  Azimuth logits shape:    {out_ident['azimuth_logits'].shape}")
+    print(f"[IMU id]  Mic positions shape:     {out_ident['mic_positions'].shape}")
 
     # (b) SLERP-interpolated random-rotation stream — exercises the full per-frame
     #     rotation path through prepare_imu_for_phasecoder → PhaseCoder.forward.
@@ -512,6 +526,7 @@ if __name__ == "__main__":
     out_dyn = model(audio, mic_coords, imu_orientations=rand_quats)
     print(f"\n[IMU dyn] Spatial embedding shape: {out_dyn['spatial_embedding'].shape}")
     print(f"[IMU dyn] Azimuth logits shape:    {out_dyn['azimuth_logits'].shape}")
+    print(f"[IMU dyn] Mic positions shape:     {out_dyn['mic_positions'].shape}")
 
     losses_dyn = criterion(out_dyn, targets)
     print(f"[IMU dyn] Total loss: {losses_dyn['loss'].item():.4f}")
